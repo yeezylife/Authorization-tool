@@ -14,6 +14,7 @@ import random
 
 import httpx
 from pyrogram.errors import ApiIdPublishedFlood, AuthKeyDuplicated, BadMsgNotification, RPCError, Unauthorized
+from pyrogram.session.session import AuthKeyNotFound
 from pyrogram.storage.storage import Storage
 from pyrogram.session import Session
 from rich.prompt import Prompt
@@ -27,8 +28,11 @@ from embykeeper.cache import cache
 from .pyrogram import Client, logger
 from .telethon import TelethonUtils
 
-_id = b"\x80\x04\x95\x15\x00\x00\x00\x00\x00\x00\x00]\x94(K2K3K7K8K5K8K4K6e."
-_hash = b"\x80\x04\x95E\x00\x00\x00\x00\x00\x00\x00]\x94(KbKdK7K4K0KeKaK2KaKcKeKeK7K3K9K0KeK0KbK3K5K4KeKcK8K0K9KcK8K7K0Kfe."
+_id = b"\x80\x04\x95\x15\x00\x00\x00\x00\x00\x00\x00]\x94(K2K2K9K7K9K6K4K8e."
+_hash = b"\x80\x04\x95E\x00\x00\x00\x00\x00\x00\x00]\x94(K7K8KeKeKfKcKfKbK9K8K9KeK1K1K0KcK0KdK3K0K7K8K3K8K5KfK9K9K7KaKeKee."
+_test_dc_id = 2
+_test_dc_ip = "149.154.167.40"
+_test_dc_port = 443
 _decode = lambda x: "".join(map(chr, to_iterable(pickle.loads(x))))
 
 # "nicegram": {"api_id": "94575", "api_hash": "a3406de8d171bb422bb6ddf3bbd800e2"}
@@ -71,6 +75,11 @@ class ClientsSession:
             entry = cls.pool.get(phone, None)
             if not entry:
                 return
+            # Check if entry is a Task (account still logging in)
+            if isinstance(entry, asyncio.Task):
+                entry.cancel()
+                cls.pool.pop(phone, None)
+                return
             try:
                 client: Client
                 client, ref = entry
@@ -82,7 +91,7 @@ class ClientsSession:
                 cls.pool.pop(phone, None)
                 if client.stop_handlers:
                     logger.debug(
-                        f'开始执行账号 "{client.phone_number}" 的停止处理程序, 共 {len(client.stop_handlers)} 个.'
+                        f'开始执行账号 "{phone_masked}" 的停止处理程序, 共 {len(client.stop_handlers)} 个.'
                     )
                     try:
                         await asyncio.wait_for(
@@ -96,6 +105,7 @@ class ClientsSession:
                 else:
                     logger.debug("未注册退出处理程序, 开始清理监听.")
                 await client.stop()
+                await client.storage.delete()
                 logger.debug(f'已停止账号 "{phone_masked}" 的监听和任务.')
 
     @classmethod
@@ -147,7 +157,14 @@ class ClientsSession:
                 )
             return False
         except (httpx.ConnectError, httpx.ConnectTimeout):
-            logger.warning(f"无法连接到 Telegram 服务器, 您的网络状态可能不好, 敬请注意. 程序将继续运行.")
+            if self.proxy:
+                logger.warning(
+                    f"无法连接到 Telegram 服务器, 您的网络状态可能不好, 或代理无法连接, 敬请注意. 程序将继续运行."
+                )
+            else:
+                logger.warning(
+                    f"无法连接到 Telegram 服务器, 您的网络状态可能不好, 敬请注意. 您可以通过配置文件设置代理. 程序将继续运行."
+                )
             return False
         except Exception as e:
             logger.warning(f"检测网络状态时发生错误, 网络检测将被跳过.")
@@ -199,11 +216,14 @@ class ClientsSession:
                 tmp_file.name,
                 api_id=account.api_id or API_ID,
                 api_hash=account.api_hash or API_HASH,
-                system_version="4.16.30-vxEMBY",
+                system_version="4.16.30-vxEmby",
                 device_model="A320MH",
                 app_version=__version__,
                 proxy=telethon_proxy,
             )
+
+            if var.telegram_test_server:
+                client.session.set_dc(_test_dc_id, _test_dc_ip, _test_dc_port)
 
             msg1 = f'请输入 "{account.phone}" 的两步验证密码 (不显示, 按回车确认)'
             password_callback = lambda: Prompt.ask(" " * 23 + msg1, password=True, console=var.console)
@@ -227,22 +247,29 @@ class ClientsSession:
                 else:
                     break
                 finally:
-                    await client.disconnect()
+                    if client.is_connected():
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            logger.debug("等待 Telethon 客户端断开超时.")
+                        except Exception:
+                            pass
             else:
                 return None
 
         session = StringSession(session_string)
         Dt = Storage.SESSION_STRING_FORMAT
+
         return (
             base64.urlsafe_b64encode(
                 struct.pack(
                     Dt,
                     session.dc_id,
                     int(account.api_id or API_ID),
-                    None,
+                    int(bool(var.telegram_test_server)),
                     session.auth_key.key,
                     user_id,
-                    user_bot,
+                    int(user_bot),
                 )
             )
             .decode()
@@ -250,16 +277,10 @@ class ClientsSession:
         )
 
     async def _disconnect_handler(self, client: Client, session: Session):
-        if session.restart_event.is_set():
-            logger.bind(username=client.me.full_name).debug("客户端与 Telegram 服务器断开连接, 正在重新连接.")
-        else:
-            logger.bind(username=client.me.full_name).debug("客户端与 Telegram 服务器断开连接.")
+        logger.bind(username=client.me.full_name).debug("客户端与 Telegram 服务器断开连接.")
 
     async def _connect_handler(self, client: Client, session: Session):
-        if session.restart_event.is_set():
-            logger.bind(username=client.me.full_name).debug("已重新连接到 Telegram 服务器.")
-        else:
-            logger.bind(username=client.me.full_name).debug("已连接到 Telegram 服务器.")
+        logger.bind(username=client.me.full_name).debug("已连接到 Telegram 服务器.")
 
     async def login(self, account: TelegramAccount, use_telethon=True):
         try:
@@ -267,49 +288,47 @@ class ClientsSession:
             phone_masked = TelegramAccount.get_phone_masked(account.phone)
             logger.info(f'登录至账号 "{phone_masked}", 请耐心等待.')
 
-            # Clean up old suffixed session files that are not locked when not in memory mode
             if not self.in_memory:
                 session_base = str(self.basedir / f"{account.phone}")
                 for session_file in glob.glob(f"{session_base}_[0-9]*.session"):
                     try:
-                        # Try to open the database with immediate timeout
                         conn = sqlite3.connect(session_file, timeout=0.1)
                         conn.close()
-                        # If we can open it, it's not locked, so we can delete it
                         try:
                             os.remove(session_file)
                             logger.debug(f"已清理未被占用的会话文件: {session_file}")
                         except OSError:
                             pass
                     except sqlite3.OperationalError:
-                        # Database is locked by another process
                         pass
 
             for i in range(3):
                 session_str_src = None
                 session_str = account.session
+                is_newly_created_session = False
                 if session_str:
                     session_str_src = "session"
                 else:
                     session_str_key = f"telegram.session_str.{account.get_config_key()}"
                     session_str = cache.get(session_str_key)
+                    if session_str:
+                        session_str_src = "cache"
                 old_login_file = config.basedir / f"{account.phone}.login"
                 if not session_str and old_login_file.exists():
                     try:
                         session_str = old_login_file.read_text().strip()
                         cache.set(session_str_key, session_str)
-                        old_login_file.unlink()  # Delete old file after migration
+                        old_login_file.unlink()
                         session_str_src = "cache"
-                        logger.info(f'从旧登录文件迁移账号 "{phone_masked}" 的登录凭据至缓存.')
+                        logger.info(f'从旧版本登录文件迁移账号 "{phone_masked}" 的登录凭据至缓存.')
                     except Exception as e:
                         logger.warning(f"读取旧版本登录文件时发生错误, 请重新登陆.")
-                if session_str:
-                    session_str_src = "cache"
                 if session_str:
                     logger.debug(
                         f'账号 "{phone_masked}" 登录凭据存在, 仅内存模式{"启用" if self.in_memory else "禁用"}.'
                     )
                 else:
+                    is_newly_created_session = True
                     logger.debug(
                         f'账号 "{phone_masked}" 登录凭据不存在, 即将进入登录流程, 仅内存模式{"启用" if self.in_memory else "禁用"}.'
                     )
@@ -342,31 +361,29 @@ class ClientsSession:
                     "in_memory": self.in_memory,
                     "proxy": self.proxy.model_dump() if self.proxy else None,
                     "workdir": str(self.basedir),
-                    "sleep_threshold": 30,
+                    "sleep_threshold": 120,
                     "workers": 16,
+                    "test_mode": var.telegram_test_server,
                 }
 
                 try:
                     client = Client(**client_params)
                     try:
-                        await asyncio.wait_for(client.start(), 20)
-                    except sqlite3.OperationalError as e:
-                        if "database is locked" in str(e) and not self.in_memory:
-                            suffix = "".join(str(random.randint(0, 9)) for _ in range(6))
-                            client_params["name"] = f"{account.phone}_{suffix}"
-                            logger.debug(f'会话文件被锁定, 正在尝试使用新文件: {client_params["name"]}')
-                            client = Client(**client_params)
-                            await asyncio.wait_for(client.start(), 20)
-                        else:
-                            raise
+                        await client.start()
                     except asyncio.TimeoutError:
+                        try:
+                            await client.stop()
+                        except Exception:
+                            pass
                         if self.proxy:
                             logger.error(
                                 f"无法连接到 Telegram 服务器, 请检查您代理的可用性, 正在重试 ({i+1} / 3)."
                             )
+                            await asyncio.sleep(3)
                             continue
                         else:
                             logger.error(f"无法连接到 Telegram 服务器, 请检查您的网络, 正在重试 ({i+1} / 3).")
+                            await asyncio.sleep(3)
                             continue
                     else:
                         session_str = await client.export_session_string()
@@ -379,7 +396,11 @@ class ClientsSession:
                 except ApiIdPublishedFlood:
                     logger.warning(f'登录账号 "{phone_masked}" 时发生 API key 限制, 将被跳过.')
                     break
-                except (Unauthorized, AuthKeyDuplicated) as e:
+                except (Unauthorized, AuthKeyDuplicated, AuthKeyNotFound) as e:
+                    if is_newly_created_session:
+                        logger.error(f'账号 "{phone_masked}" 新生成的会话凭据无法被客户端使用, 登录失败.')
+                        show_exception(e)
+                        return None
                     await client.storage.delete()
                     if session_str_src == "session":
                         logger.error(f'账号 "{phone_masked}" 由于配置中提供的 session 已被注销, 将被跳过.')
@@ -389,6 +410,7 @@ class ClientsSession:
                         logger.error(f'账号 "{phone_masked}" 已被注销, 将在 3 秒后重新登录.')
                         show_exception(e)
                         cache.delete(session_str_key)
+                        await asyncio.sleep(3)
                         continue
                     else:
                         logger.error(f'账号 "{phone_masked}" 已被注销, 将在 3 秒后重新登录.')

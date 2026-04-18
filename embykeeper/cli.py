@@ -2,7 +2,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import List
+from typing import List, Optional
 from functools import wraps
 
 import typer
@@ -78,7 +78,7 @@ app = AsyncTyper(
     pretty_exceptions_enable=False,
     rich_markup_mode="rich",
     add_completion=False,
-    context_settings={"help_option_names": ["-h", "--help"]},
+    add_help_option=False,
 )
 
 
@@ -94,6 +94,13 @@ def print_example_config(flag):
         raise typer.Exit()
 
 
+def print_help(ctx: typer.Context, param: typer.CallbackParam, value: bool):
+    if not value or ctx.resilient_parsing:
+        return
+    typer.echo(ctx.get_help())
+    raise typer.Exit()
+
+
 @app.async_command(
     help=(
         f"欢迎使用 [orange3]{__product__.capitalize()}[/] {__version__} " ":cinema: 无参数默认开启全部功能."
@@ -107,6 +114,15 @@ async def main(
         envvar=f"EK_CONFIG_FILE",
         rich_help_panel="参数",
         help="配置文件 (置空以生成)",
+    ),
+    help: bool = typer.Option(
+        None,
+        "--help",
+        "-h",
+        callback=print_help,
+        is_eager=True,
+        rich_help_panel="调试参数",
+        help="显示此帮助信息并退出.",
     ),
     checkiner: bool = typer.Option(
         False,
@@ -142,6 +158,20 @@ async def main(
         "-s",
         rich_help_panel="模块开关",
         help="仅启用自动水群功能",
+    ),
+    registrar: bool = typer.Option(
+        False,
+        "--registrar",
+        "-r",
+        rich_help_panel="模块开关",
+        help="仅启用注册功能",
+    ),
+    registrar_bot: Optional[str] = typer.Option(
+        None,
+        "--registrar-bot",
+        "-R",
+        rich_help_panel="模块开关",
+        help="快速反复尝试注册指定机器人 (Embyboss)",
     ),
     version: bool = typer.Option(
         None,
@@ -189,13 +219,17 @@ async def main(
     ),
     debug_cron: bool = typer.Option(
         False,
+        "--debug-cron",
         envvar="EK_DEBUG_CRON",
         show_envvar=False,
+        rich_help_panel="调试工具",
         help="开启任务调试模式, 在三秒后立刻开始执行计划任务",
     ),
     debug_notify: bool = typer.Option(
         False,
+        "--debug-notify",
         show_envvar=False,
+        rich_help_panel="调试工具",
         help="开启日志调试模式, 发送一条日志记录和即时日志记录后退出",
     ),
     simple_log: bool = typer.Option(
@@ -253,6 +287,13 @@ async def main(
         rich_help_panel="调试参数",
         help="记录执行过程中的原始更新日志",
     ),
+    telegram_test_server: bool = typer.Option(
+        False,
+        "--telegram-test-server",
+        rich_help_panel="调试参数",
+        hidden=True,
+        help="使用 Telegram 测试服务器",
+    ),
     public: bool = typer.Option(
         False,
         "--public",
@@ -286,7 +327,7 @@ async def main(
     clean: bool = typer.Option(
         False,
         "--clean",
-        rich_help_panel="调试参数",
+        rich_help_panel="调试工具",
         help="显示或清理 Emby 模拟设备和登陆凭据等缓存",
     ),
 ):
@@ -326,6 +367,9 @@ async def main(
     if verbosity:
         logger.warning(f"您当前处于调试模式: 日志等级 {verbosity}.")
         app.pretty_exceptions_enable = True
+    var.telegram_test_server = telegram_test_server
+    if telegram_test_server:
+        logger.warning("您当前处于 Telegram 测试服务器模式, 请谨慎使用.")
 
     config.basedir = basedir
     config.windows = windows
@@ -349,12 +393,13 @@ async def main(
         logger.warning("您当前处于计划任务调试模式, 将在 10 秒后运行计划任务.")
     config.noexit = noexit
 
-    if not checkiner and not monitor and not emby and not messager and not subsonic:
+    if not checkiner and not monitor and not emby and not messager and not subsonic and not registrar:
         checkiner = True
         emby = True
         subsonic = True
         monitor = True
         messager = True
+        registrar = True
 
     config.on_change(
         "proxy", lambda x, y: logger.bind(scheme="config").warning("修改代理设置后, 可能需要重启程序以生效.")
@@ -374,6 +419,17 @@ async def main(
             cache.delete("test")
         except Exception as e:
             logger.error(f"MongoDB 缓存连接失败: {e}, 程序将退出.")
+            show_exception(e, regular=False)
+            return
+    else:
+        try:
+            from .cache import cache
+
+            cache.set("test", "test")
+            assert cache.get("test", None) == "test"
+            cache.delete("test")
+        except Exception as e:
+            logger.error(f"本地缓存读写失败: {e}, 请使用 MongoDB 缓存, 程序将退出.")
             show_exception(e, regular=False)
             return
 
@@ -423,7 +479,7 @@ async def main(
         return await dumper(dump)
 
     if debug_notify:
-        from .telegram.debug import debug_notifier
+        from .notify import debug_notifier
 
         return await debug_notifier()
 
@@ -446,6 +502,12 @@ async def main(
 
             message_man = MessageManager()
 
+        register_man = None
+        if registrar or registrar_bot:
+            from .telegram.registrar_main import RegisterManager
+
+            register_man = RegisterManager()
+
         emby_man = None
         if emby:
             from .emby.main import EmbyManager
@@ -459,6 +521,15 @@ async def main(
             subsonic_man = SubsonicManager()
 
         pool = AsyncTaskPool()
+
+        if registrar_bot:
+            logger.info(f"开始快速注册 @{registrar_bot}")
+            if register_man:
+                await register_man.run_single_bot(registrar_bot, instant=True)
+            else:
+                logger.error("注册管理器未初始化")
+            return
+
         if instant and not debug_cron:
             if checkin_man:
                 pool.add(checkin_man.run_all(instant=True), "站点签到")
@@ -469,12 +540,14 @@ async def main(
             await pool.wait()
             logger.debug("启动时立刻执行签到和保活: 已完成.")
         if (not once) or config.noexit:
-            from .telegram.notify import start_notifier
+            from .notify import start_notifier
 
             streams = await start_notifier()
         if not once:
             if checkin_man:
                 pool.add(checkin_man.schedule_all(), "站点签到")
+            if register_man:
+                pool.add(register_man.start(), "站点注册")
             if monitor_man:
                 pool.add(monitor_man.run_all(), "群组监控")
             if message_man:

@@ -1,6 +1,6 @@
 import asyncio
 import random
-from typing import Iterable, List, Optional, Union
+from typing import List, Optional, Union
 
 from loguru import logger
 from pydantic import BaseModel, ValidationError
@@ -69,7 +69,7 @@ class TemplateACheckin(BotCheckin):
             else self.bot_use_captcha
         )
 
-        self.log = logger.bind(scheme="telechecker", name=self.name)
+        self.log = logger.bind(scheme="telechecker", name=self.name, username=self.client.me.full_name)
         return True
 
     async def message_handler(self, client, message: Message):
