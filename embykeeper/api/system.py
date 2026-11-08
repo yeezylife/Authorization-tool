@@ -7,7 +7,6 @@ from .auth import require_auth
 from ..schema import Config
 from ..config import config as config_manager
 
-
 router = APIRouter()
 
 
@@ -23,10 +22,14 @@ def _module_summary(cfg: Config) -> Dict[str, int]:
     subsonic_accounts = cfg.subsonic.account if cfg.subsonic and cfg.subsonic.account else []
 
     return {
-        "checkiner_accounts": sum(1 for account in telegram_accounts if account.enabled and account.checkiner),
+        "checkiner_accounts": sum(
+            1 for account in telegram_accounts if account.enabled and account.checkiner
+        ),
         "monitor_accounts": sum(1 for account in telegram_accounts if account.enabled and account.monitor),
         "messager_accounts": sum(1 for account in telegram_accounts if account.enabled and account.messager),
-        "registrar_accounts": sum(1 for account in telegram_accounts if account.enabled and account.registrar),
+        "registrar_accounts": sum(
+            1 for account in telegram_accounts if account.enabled and account.registrar
+        ),
         "emby_accounts": sum(1 for account in emby_accounts if account.enabled),
         "subsonic_accounts": sum(1 for account in subsonic_accounts if account.enabled),
     }
@@ -37,10 +40,9 @@ async def status(_: bool = Depends(require_auth)):
     try:
         from ..runinfo import RunContext, RunStatus
         from ..cache import cache
-        import tomli as tomllib
+        from .config import _read_config_dict
 
-        cfg_path = config_manager.basedir / "config.toml"
-        cfg = Config(**(tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}))
+        cfg = Config(**_read_config_dict())
         counts = _count_accounts(cfg)
 
         running = []
@@ -61,12 +63,16 @@ async def status(_: bool = Depends(require_auth)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get status: {e}")
+
+
 @router.post("/system/stop")
 async def stop(_: bool = Depends(require_auth)):
     raise HTTPException(
         status_code=410,
         detail="Business process lifecycle is managed by /api/pm/* on the panel API.",
     )
+
+
 @router.post("/system/restart")
 async def restart(_: bool = Depends(require_auth)):
     raise HTTPException(

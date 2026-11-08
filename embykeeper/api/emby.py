@@ -5,29 +5,29 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-import tomli as tomllib
-import tomlkit
+from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 from .auth import require_auth
+from .config import _read_config_dict, _write_config_dict
 from .runinfo import _sort_datetime
 from ..cache import cache
 from ..schema import Config, EmbyAccount, format_errors
 from ..config import config as config_manager
 from ..runinfo import RunContext, RunStatus
+from ..emby.api import Emby, EmbyError
 from ..emby.main import EmbyManager
-
 
 router = APIRouter()
 
-EMBY_ACCOUNT_HISTORY_LIMIT = 2
+EMBY_ACCOUNT_HISTORY_LIMIT = 30
 EMBY_ACCOUNT_RUN_HISTORY_LIMIT = 20
 
 
 class EmbyAccountPayload(BaseModel):
     url: str
     username: str
-    password: str = ''
+    password: str = ""
     name: Optional[str] = None
     enabled: bool = True
     use_proxy: bool = True
@@ -44,27 +44,18 @@ class EmbySettingsPayload(BaseModel):
     enabled: bool = True
 
 
-def _config_path():
-    return config_manager.basedir / "config.toml"
-
-
-def _read_config_dict() -> Dict[str, Any]:
-    cfg_path = _config_path()
-    if not cfg_path.exists():
-        return {}
-    with open(cfg_path, "rb") as file:
-        return tomllib.load(file)
-
-
-def _write_config_dict(cfg: Dict[str, Any]):
-    cfg_path = _config_path()
-    with open(cfg_path, "w", encoding="utf-8") as file:
-        file.write(tomlkit.dumps(cfg))
+class EmbyPlayIdProbePayload(BaseModel):
+    url: str
+    username: str
+    password: str = ""
+    name: Optional[str] = None
+    use_proxy: bool = True
+    cf_challenge: bool = True
+    play_id: str
 
 
 def _load_config() -> Config:
-    cfg_path = config_manager.basedir / "config.toml"
-    return Config(**(tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}))
+    return Config(**_read_config_dict())
 
 
 def _generate_account_id(existing_ids: Set[str]) -> str:
@@ -165,7 +156,9 @@ def _match_account_run(ctx: RunContext, account: EmbyAccount) -> bool:
     target = _account_log_target(account)
     for log in ctx.yield_logs(reverse=True):
         message = str(log.message or "")
-        if target in message and ("保活成功" in message or "保活失败" in message or "正在登陆" in message or "成功登陆" in message):
+        if target in message and (
+            "保活成功" in message or "保活失败" in message or "正在登陆" in message or "成功登陆" in message
+        ):
             return True
     return False
 
@@ -185,7 +178,9 @@ def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
     }
 
 
-def _account_run_history(account: EmbyAccount, limit: int = EMBY_ACCOUNT_RUN_HISTORY_LIMIT) -> List[Dict[str, Any]]:
+def _account_run_history(
+    account: EmbyAccount, limit: int = EMBY_ACCOUNT_RUN_HISTORY_LIMIT
+) -> List[Dict[str, Any]]:
     contexts = [ctx for ctx in RunContext.list_all() if _match_account_run(ctx, account)]
     contexts.sort(key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time), reverse=True)
     return [_serialize_run_summary(ctx) for ctx in contexts[:limit]]
@@ -218,7 +213,10 @@ def _find_account_by_key(account_key: str) -> EmbyAccount:
 
 async def _run_single_account(account: EmbyAccount, description: Optional[str] = None):
     manager = EmbyManager()
-    result = await manager._watch_main([account], instant=True, description=description)
+    test_account = account.model_copy(update={"enabled": True})
+    result = await manager._watch_main(
+        [test_account], instant=True, description=description, connect_only=True
+    )
     if result is None:
         raise HTTPException(status_code=500, detail="Failed to start Emby test run")
     return result
@@ -326,7 +324,9 @@ def _replace_accounts(raw: Dict[str, Any], accounts: List[EmbyAccount]) -> Dict[
     return merged
 
 
-def _ensure_emby_account_ids(model: Config, raw: Dict[str, Any], accounts: List[EmbyAccount]) -> Tuple[Config, Dict[str, Any], List[EmbyAccount]]:
+def _ensure_emby_account_ids(
+    model: Config, raw: Dict[str, Any], accounts: List[EmbyAccount]
+) -> Tuple[Config, Dict[str, Any], List[EmbyAccount]]:
     existing_ids = {_account_key(account) for account in accounts if _account_key(account)}
     normalized: List[EmbyAccount] = []
     changed = False
@@ -346,7 +346,7 @@ def _ensure_emby_account_ids(model: Config, raw: Dict[str, Any], accounts: List[
 
     merged = _replace_accounts(raw, normalized)
     validated = Config(**merged)
-    serialized = validated.model_dump(mode='json', exclude_none=True, exclude_unset=True)
+    serialized = validated.model_dump(mode="json", exclude_none=True, exclude_unset=True)
     _write_config_dict(serialized)
     persisted_accounts = list(validated.emby.account if validated.emby and validated.emby.account else [])
     return validated, serialized, persisted_accounts
@@ -373,7 +373,9 @@ async def list_emby_accounts(_: bool = Depends(require_auth)):
             "module_enabled": bool(cfg.emby.enabled) if cfg.emby and cfg.emby.enabled is not None else True,
             "concurrency": cfg.emby.concurrency if cfg.emby and cfg.emby.concurrency is not None else 1,
             "time_range": str(cfg.emby.time_range) if cfg.emby and cfg.emby.time_range is not None else None,
-            "interval_days": str(cfg.emby.interval_days) if cfg.emby and cfg.emby.interval_days is not None else None,
+            "interval_days": (
+                str(cfg.emby.interval_days) if cfg.emby and cfg.emby.interval_days is not None else None
+            ),
         }
         for a in accounts:
             status = _serialize_account(a)
@@ -401,7 +403,7 @@ async def save_emby_settings(payload: EmbySettingsPayload, _: bool = Depends(req
         merged["emby"] = emby_section
 
         validated = Config(**merged)
-        _write_config_dict(validated.model_dump(mode='json', exclude_none=True, exclude_unset=True))
+        _write_config_dict(validated.model_dump(mode="json", exclude_none=True, exclude_unset=True))
         return {"success": True}
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=format_errors(e))
@@ -444,16 +446,32 @@ async def get_emby_account_device(key: str = Query(...), _: bool = Depends(requi
 
 
 @router.post("/emby/accounts/test-run")
-async def start_emby_account_test_run(key: str = Query(...), _: bool = Depends(require_auth)):
+async def start_emby_account_test_run(
+    key: Optional[str] = Query(None),
+    payload: Optional[EmbyAccountPayload] = None,
+    _: bool = Depends(require_auth),
+):
     try:
-        account = _find_account_by_key(key)
+        if key:
+            account = _find_account_by_key(key)
+            if payload is not None:
+                payload_data = payload.model_dump(exclude_none=True)
+                if not payload_data.get("password"):
+                    payload_data["password"] = account.password
+                account = EmbyAccount(id=_account_key(account), **payload_data)
+        elif payload is not None:
+            account = EmbyAccount(id=_generate_account_id(set()), **payload.model_dump(exclude_none=True))
+        else:
+            raise HTTPException(status_code=400, detail="key or account payload required")
+
         description = f"Emby 测试运行 - {_account_spec(account)}"
+        existing_ids = {ctx.id for ctx in RunContext.list_all()}
         task = asyncio.create_task(_run_single_account(account, description=description))
 
         run_id = None
         for _ in range(30):
             for ctx in RunContext.list_all():
-                if ctx.description == description:
+                if ctx.id not in existing_ids and ctx.description == description:
                     run_id = ctx.id
                     break
 
@@ -476,6 +494,85 @@ async def start_emby_account_test_run(key: str = Query(...), _: bool = Depends(r
         raise HTTPException(status_code=500, detail=f"Failed to start emby account test run: {e}")
 
 
+@router.post("/emby/accounts/probe-item")
+async def probe_emby_play_item(
+    payload: EmbyPlayIdProbePayload,
+    key: Optional[str] = Query(None),
+    _: bool = Depends(require_auth),
+):
+    """Log in with the supplied credentials and resolve the given play ID to an item.
+
+    This is the lightweight counterpart of the test-run endpoint: it only verifies
+    that the account can log in and that the configured video ID exists, without
+    actually starting a playback task.
+    """
+    play_id = (payload.play_id or "").strip()
+    if not play_id:
+        raise HTTPException(status_code=400, detail="请先填写播放 ID")
+
+    try:
+        password = payload.password
+        account_id: Optional[str] = None
+
+        if key:
+            existing = _find_account_by_key(key)
+            account_id = _account_key(existing)
+            if not password:
+                password = existing.password
+
+        if not account_id:
+            account_id = _generate_account_id(set())
+
+        account_data: Dict[str, Any] = {
+            "id": account_id,
+            "url": payload.url,
+            "username": payload.username,
+            "password": password,
+            "use_proxy": payload.use_proxy,
+            "cf_challenge": payload.cf_challenge,
+            "play_id": play_id,
+        }
+        if payload.name:
+            account_data["name"] = payload.name
+
+        account = EmbyAccount(**account_data)
+
+        emby = Emby(account)
+        emby.log = logger.bind(server=account.name or emby.hostname, username=account.username)
+
+        if not emby.user_id and not await emby.login():
+            raise HTTPException(status_code=400, detail="登录失败, 无法访问该站点")
+
+        item = await emby.get_item(play_id)
+        if not item or not item.get("Id"):
+            raise HTTPException(status_code=404, detail="未找到该视频项目, 请确认播放 ID 是否正确")
+
+        try:
+            duration_seconds = round(int(item.get("RunTimeTicks") or 0) / 10_000_000)
+        except (TypeError, ValueError):
+            duration_seconds = 0
+
+        return {
+            "success": True,
+            "item": {
+                "id": item.get("Id"),
+                "name": item.get("Name"),
+                "type": item.get("Type"),
+                "series": item.get("SeriesName"),
+                "year": item.get("ProductionYear"),
+                "duration_seconds": duration_seconds,
+            },
+        }
+    except HTTPException:
+        raise
+    except EmbyError as e:
+        raise HTTPException(status_code=400, detail=f"测试播放 ID 失败: {e}")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=format_errors(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"测试播放 ID 失败: {e}")
+
+
 @router.post("/emby/accounts")
 async def create_emby_account(payload: EmbyAccountPayload, _: bool = Depends(require_auth)):
     try:
@@ -490,7 +587,7 @@ async def create_emby_account(payload: EmbyAccountPayload, _: bool = Depends(req
         accounts.append(account)
         merged = _replace_accounts(raw, accounts)
         validated = Config(**merged)
-        _write_config_dict(validated.model_dump(mode='json', exclude_none=True, exclude_unset=True))
+        _write_config_dict(validated.model_dump(mode="json", exclude_none=True, exclude_unset=True))
         return {"success": True, "account": _serialize_account(account)}
     except HTTPException:
         raise
@@ -501,7 +598,9 @@ async def create_emby_account(payload: EmbyAccountPayload, _: bool = Depends(req
 
 
 @router.put("/emby/accounts")
-async def update_emby_account(key: str = Query(...), payload: EmbyAccountPayload = None, _: bool = Depends(require_auth)):
+async def update_emby_account(
+    key: str = Query(...), payload: EmbyAccountPayload = None, _: bool = Depends(require_auth)
+):
     try:
         _, raw, accounts = _load_emby_accounts()
         updated = False
@@ -510,10 +609,13 @@ async def update_emby_account(key: str = Query(...), payload: EmbyAccountPayload
 
         for account in accounts:
             if _account_key(account) == key:
-                payload_data = payload.model_dump(exclude_none=True)
-                if not payload_data.get('password'):
-                    payload_data['password'] = account.password
-                next_account = EmbyAccount(id=_account_key(account), **payload_data)
+                payload_data = payload.model_dump(exclude_unset=True)
+                if not payload_data.get("password"):
+                    payload_data["password"] = account.password
+                account_data = account.model_dump(exclude_none=False)
+                account_data.update(payload_data)
+                account_data["id"] = _account_key(account)
+                next_account = EmbyAccount(**account_data)
                 next_accounts.append(next_account)
                 updated = True
             else:
@@ -522,12 +624,19 @@ async def update_emby_account(key: str = Query(...), payload: EmbyAccountPayload
         if not updated:
             raise HTTPException(status_code=404, detail="Emby account not found")
 
-        if sum(1 for account in next_accounts if _account_signature(account) == _account_signature(next_account)) > 1:
+        if (
+            sum(
+                1
+                for account in next_accounts
+                if _account_signature(account) == _account_signature(next_account)
+            )
+            > 1
+        ):
             raise HTTPException(status_code=409, detail="Emby account already exists")
 
         merged = _replace_accounts(raw, next_accounts)
         validated = Config(**merged)
-        _write_config_dict(validated.model_dump(mode='json', exclude_none=True, exclude_unset=True))
+        _write_config_dict(validated.model_dump(mode="json", exclude_none=True, exclude_unset=True))
         return {"success": True, "account": _serialize_account(next_account)}
     except HTTPException:
         raise
@@ -548,7 +657,7 @@ async def delete_emby_account(key: str = Query(...), _: bool = Depends(require_a
 
         merged = _replace_accounts(raw, next_accounts)
         validated = Config(**merged)
-        _write_config_dict(validated.model_dump(mode='json', exclude_none=True, exclude_unset=True))
+        _write_config_dict(validated.model_dump(mode="json", exclude_none=True, exclude_unset=True))
         return {"success": True}
     except HTTPException:
         raise

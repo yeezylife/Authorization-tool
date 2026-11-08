@@ -1,4 +1,5 @@
 """Embykeeper API module."""
+
 import asyncio
 import sys
 from contextlib import asynccontextmanager
@@ -56,6 +57,8 @@ def create_app(allow_origins: List[str] = None) -> FastAPI:
     from .telegram import router as telegram_router
     from .emby import router as emby_router
     from .subsonic import router as subsonic_router
+    from .sites import router as sites_router
+    from .ops import router as ops_router
 
     app.include_router(config_router, prefix="/api")
     app.include_router(runinfo_router, prefix="/api")
@@ -64,6 +67,8 @@ def create_app(allow_origins: List[str] = None) -> FastAPI:
     app.include_router(telegram_router, prefix="/api")
     app.include_router(emby_router, prefix="/api")
     app.include_router(subsonic_router, prefix="/api")
+    app.include_router(sites_router, prefix="/api")
+    app.include_router(ops_router, prefix="/api")
 
     @app.get("/")
     async def root():

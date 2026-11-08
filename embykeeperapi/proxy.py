@@ -8,7 +8,6 @@ from fastapi.responses import StreamingResponse
 from .auth import require_auth
 from .pm import pm
 
-
 router = APIRouter()
 
 
@@ -57,26 +56,36 @@ async def proxy_api(request: Request, path: str, _: bool = Depends(require_auth)
     try:
         if accepts_event_stream:
             client = httpx.AsyncClient(timeout=None, trust_env=False)
-            resp = await client.stream(method, target, params=params, headers=headers, content=content).__aenter__()
+            proxy_request = client.build_request(
+                method, target, params=params, headers=headers, content=content
+            )
+            resp = await client.send(proxy_request, stream=True)
             resp_headers = _filter_headers(dict(resp.headers))
             content_type = resp_headers.get("content-type")
 
             async def gen():
                 try:
-                    async for chunk in resp.aiter_raw():
+                    async for chunk in resp.aiter_bytes():
                         yield chunk
                 except (asyncio.CancelledError, httpx.ReadError):
                     pass
                 finally:
                     await _close_stream(resp, client)
 
-            return StreamingResponse(gen(), status_code=resp.status_code, headers=resp_headers, media_type=content_type)
+            return StreamingResponse(
+                gen(), status_code=resp.status_code, headers=resp_headers, media_type=content_type
+            )
 
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             resp = await client.request(method, target, params=params, headers=headers, content=content)
             resp_headers = _filter_headers(dict(resp.headers))
             content_type = resp_headers.get("content-type")
-            return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers, media_type=content_type)
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=resp_headers,
+                media_type=content_type,
+            )
     except httpx.ConnectError as e:
         raise HTTPException(status_code=503, detail=f"Failed to connect backend: {e}")
     except httpx.ReadError as e:

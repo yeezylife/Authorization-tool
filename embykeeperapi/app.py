@@ -1,25 +1,32 @@
 import os
+import errno
+import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
 import signal
 import time
+from pathlib import Path
 from types import FrameType
 from typing import Callable, List, Optional
 
 import typer
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import Config, Server
 from uvicorn.supervisors import ChangeReload
 
 from . import __version__
 
-from .auth import require_auth, router as auth_router
+from .auth import require_auth, router as auth_router, validate_webpass
 from .pm import router as pm_router, pm
 from .proxy import router as proxy_router
 from .sse import router as sse_router
 from .kv_router import router as kv_router
+from .settings_router import router as settings_router
+from .state_store import check_mongodb
 from .events import register_broadcast_loop, reset_shutdown_event, signal_shutdown, signal_shutdown_async
 
 cli = typer.Typer(help="Embykeeper Panel API server")
@@ -27,7 +34,53 @@ STARTED_AT = datetime.now(timezone.utc)
 logger = logging.getLogger("uvicorn.error")
 TARGET_HOST_ENV = "EMBYKEEPERAPI_TARGET_HOST"
 TARGET_PORT_ENV = "EMBYKEEPERAPI_TARGET_PORT"
+STATIC_DIR_ENV = "EMBYKEEPERAPI_STATIC_DIR"
 BACKEND_SHUTDOWN_LOG_GRACE_SECONDS = 0.5
+
+
+def _resolve_static_dir() -> Optional[Path]:
+    """定位已构建的面板界面, 未随部署提供界面时返回 None (仅提供 API)."""
+    candidates: List[Path] = []
+
+    env_value = os.environ.get(STATIC_DIR_ENV, "").strip()
+    if env_value:
+        candidates.append(Path(env_value).expanduser())
+
+    package_root = Path(__file__).resolve().parent
+    candidates.append(package_root / "static")
+    candidates.append(package_root.parent / "frontend" / "dist")
+    candidates.append(Path("/opt/embykeeper-panel/static"))
+
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate.resolve()
+
+    return None
+
+
+class PanelUIStaticFiles(StaticFiles):
+    """面板界面静态资源, 未知路径回落 index.html 以支持前端路由."""
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or path.startswith("api/"):
+                raise
+            return await super().get_response("index.html", scope)
+
+
+def _ensure_bind_available(host: str, port: int) -> None:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                logger.error("Address already in use: %s:%s", host, port)
+            else:
+                logger.error("Unable to bind %s:%s: %s", host, port, exc)
+            raise typer.Exit(1) from exc
 
 
 def _configure_pm_target_from_env() -> None:
@@ -83,8 +136,12 @@ class PanelServer(Server):
                 pm.force_stop(pid)
                 return
 
-            if (not announced_wait) and (time.monotonic() - started_waiting_at >= BACKEND_SHUTDOWN_LOG_GRACE_SECONDS):
-                logger.info("Waiting for managed Embykeeper backend to stop. Press Ctrl+C again to force quit.")
+            if (not announced_wait) and (
+                time.monotonic() - started_waiting_at >= BACKEND_SHUTDOWN_LOG_GRACE_SECONDS
+            ):
+                logger.info(
+                    "Waiting for managed Embykeeper backend to stop. Press Ctrl+C again to force quit."
+                )
                 announced_wait = True
 
             await asyncio.sleep(0.2)
@@ -131,8 +188,12 @@ class PanelReload(ChangeReload):
                 pm.force_stop(pid)
                 return
 
-            if (not announced_wait) and (time.monotonic() - started_waiting_at >= BACKEND_SHUTDOWN_LOG_GRACE_SECONDS):
-                logger.info("Waiting for managed Embykeeper backend to stop. Press Ctrl+C again to force quit.")
+            if (not announced_wait) and (
+                time.monotonic() - started_waiting_at >= BACKEND_SHUTDOWN_LOG_GRACE_SECONDS
+            ):
+                logger.info(
+                    "Waiting for managed Embykeeper backend to stop. Press Ctrl+C again to force quit."
+                )
                 announced_wait = True
 
             time.sleep(0.2)
@@ -143,6 +204,7 @@ async def lifespan(_app: FastAPI):
     import asyncio
     import sys
 
+    validate_webpass()
     loop = asyncio.get_running_loop()
 
     # Suppress noisy ConnectionResetError on Windows when SSE/proxy clients disconnect.
@@ -193,6 +255,7 @@ def build_app(allow_origins: List[str] = None) -> FastAPI:
     app.include_router(pm_router, prefix="/api")
     app.include_router(sse_router, prefix="/api")
     app.include_router(kv_router, prefix="/api")
+    app.include_router(settings_router, prefix="/api")
 
     @app.get("/api/panel/health")
     async def panel_health(_: bool = Depends(require_auth)):
@@ -204,16 +267,27 @@ def build_app(allow_origins: List[str] = None) -> FastAPI:
             "backend": pm.status(),
         }
 
+    @app.get("/healthz")
+    async def healthz():
+        # Platform health checks (Koyeb / Render) hit this without credentials.
+        return {"status": "ok"}
+
     # Finally mount proxy that forwards /api/* to backend
     app.include_router(proxy_router)
 
-    @app.get("/")
-    async def root():
-        return {
-            "message": "Embykeeper Panel API",
-            "version": __version__,
-            "backend": pm.status(),
-        }
+    static_dir = _resolve_static_dir()
+    if static_dir is not None:
+        # 服务端已带界面 (镜像或源码构建) 时, 同源提供界面与 API
+        logger.info("Serving panel UI from %s", static_dir)
+        app.mount("/", PanelUIStaticFiles(directory=str(static_dir), html=True), name="panel-ui")
+    else:
+
+        @app.get("/")
+        async def root():
+            return {
+                "message": "Embykeeper Panel API",
+                "version": __version__,
+            }
 
     return app
 
@@ -230,8 +304,23 @@ def _run_server(
     reload: bool = typer.Option(False, help="Auto-reload on code changes"),
     debug: bool = typer.Option(False, help="Enable uvicorn access log"),
     cors: List[str] = typer.Option([], help="Add extra CORS origins, repeatable"),
+    server_callback: Optional[Callable[[PanelServer], None]] = None,
 ):
     """Start panel server via uvicorn and optionally manage backend."""
+    try:
+        validate_webpass()
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    try:
+        check_mongodb()
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    _ensure_bind_available(host, port)
+
     pm.host = target_host
     pm.port = target_port
     os.environ[TARGET_HOST_ENV] = target_host
@@ -255,6 +344,8 @@ def _run_server(
     )
 
     server = PanelServer(config=config, managed_backend=owned_backend)
+    if server_callback is not None:
+        server_callback(server)
 
     if config.should_reload:
         sock = config.bind_socket()

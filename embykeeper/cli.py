@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import List, Optional
 from functools import wraps
 
 import typer
+from typer.core import TyperCommand
 import asyncio
 from loguru import logger
 from appdirs import user_data_dir
@@ -74,6 +76,16 @@ class AsyncTyper(typer.Typer):
         return decorator
 
 
+class EmbykeeperCommand(TyperCommand):
+    def main(self, args=None, prog_name=None, **kwargs):
+        arguments = list(sys.argv[1:] if args is None else args)
+        if arguments and arguments[0] == "web":
+            from embykeeperapi.app import cli as panel_cli
+
+            return panel_cli(args=arguments[1:], prog_name=f"{prog_name or 'embykeeper'} web", **kwargs)
+        return super().main(args=arguments, prog_name=prog_name, **kwargs)
+
+
 app = AsyncTyper(
     pretty_exceptions_enable=False,
     rich_markup_mode="rich",
@@ -101,10 +113,80 @@ def print_help(ctx: typer.Context, param: typer.CallbackParam, value: bool):
     raise typer.Exit()
 
 
+async def _prepare_mongodb_source(mongodb_url: str, config_file: Path = None) -> bool:
+    """Use MongoDB for both the config document and the runtime cache."""
+
+    from .config_source import ConfigSourceError, MongoConfigSource
+    from .schema import Config as CoreConfig
+
+    logger.info("正在连接到 MongoDB, 配置与缓存将全部保存在数据库中.")
+    try:
+        source = MongoConfigSource(mongodb_url)
+        source.check()
+    except ConfigSourceError as exc:
+        logger.error(f"{exc}, 程序将退出.")
+        return False
+
+    config.set_source(source)
+    _migrate_local_state(source, config_file)
+    config.set(CoreConfig(mongodb=mongodb_url))
+    if not await config.reload_conf():
+        return False
+    # A stored document may not carry the connection string, keep the cache on MongoDB.
+    config.mongodb = mongodb_url
+    return True
+
+
+def _migrate_local_state(source, config_file: Path = None, basedir: Path = None) -> None:
+    """Import a leftover file-based config and cache once, on first MongoDB start."""
+
+    from .config_source import ConfigSourceError, FileConfigSource
+    from .schema import Config as CoreConfig
+
+    data_dir = Path(basedir) if basedir else config.basedir
+    try:
+        if not source.read():
+            legacy = Path(config_file) if config_file else data_dir / "config.toml"
+            data = FileConfigSource(legacy).read() if legacy.exists() else {}
+            if data:
+                CoreConfig(**data)
+                source.write(data)
+                logger.info(f'已将 "{legacy}" 中的配置导入 MongoDB.')
+    except ConfigSourceError as exc:
+        logger.warning(f"导入本地配置到 MongoDB 失败: {exc}")
+    except Exception as exc:
+        logger.warning(f"本地配置文件无效, 未导入 MongoDB: {exc}")
+
+    cache_file = data_dir / "cache.json"
+    if not cache_file.exists():
+        return
+    try:
+        if not source.cache_empty():
+            return
+        items = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(f'读取 "{cache_file}" 失败, 未导入缓存: {exc}')
+        return
+    except ConfigSourceError as exc:
+        logger.warning(f"检查 MongoDB 缓存失败: {exc}")
+        return
+    if not isinstance(items, dict) or not items:
+        return
+    try:
+        count = source.import_cache(items)
+    except Exception as exc:
+        logger.warning(f"导入本地缓存到 MongoDB 失败: {exc}")
+        return
+    cache_file.rename(cache_file.with_suffix(".json.migrated"))
+    logger.info(f'已将 "{cache_file}" 中的 {count} 条缓存导入 MongoDB.')
+
+
 @app.async_command(
+    cls=EmbykeeperCommand,
+    epilog="网页管理: embykeeper web",
     help=(
         f"欢迎使用 [orange3]{__product__.capitalize()}[/] {__version__} " ":cinema: 无参数默认开启全部功能."
-    )
+    ),
 )
 async def main(
     config_file: Path = typer.Argument(
@@ -400,7 +482,11 @@ async def main(
         if not await public_preparation():
             raise typer.Exit(1)
     else:
-        if not await config.reload_conf(config_file):
+        mongodb_url = os.environ.get("EK_MONGODB", "").strip()
+        if mongodb_url:
+            if not await _prepare_mongodb_source(mongodb_url, config_file):
+                raise typer.Exit(1)
+        elif not await config.reload_conf(config_file):
             raise typer.Exit(1)
 
     if api:
@@ -575,7 +661,9 @@ async def main(
         def start_telegram_runtime_tasks(targets=None):
             selected = set(targets or ("checkiner", "registrar", "monitor", "messager"))
             if "checkiner" in selected and checkin_man:
-                track_runtime_task(telegram_runtime_tasks, "checkiner", checkin_man.schedule_all(), "站点签到")
+                track_runtime_task(
+                    telegram_runtime_tasks, "checkiner", checkin_man.schedule_all(), "站点签到"
+                )
             if "registrar" in selected and register_man:
                 track_runtime_task(telegram_runtime_tasks, "registrar", register_man.start(), "站点注册")
             if "monitor" in selected and monitor_man:
@@ -588,11 +676,17 @@ async def main(
             if "emby" in selected and emby_man:
                 track_runtime_task(media_runtime_tasks, "emby", emby_man.schedule_all(), "Emby 保活")
             if "subsonic" in selected and subsonic_man:
-                track_runtime_task(media_runtime_tasks, "subsonic", subsonic_man.schedule_all(), "Subsonic 保活")
+                track_runtime_task(
+                    media_runtime_tasks, "subsonic", subsonic_man.schedule_all(), "Subsonic 保活"
+                )
 
         async def cancel_runtime_tasks(task_store: dict, targets):
             selected = set(targets)
-            current_tasks = [task_store.get(name) for name in selected if task_store.get(name) and not task_store.get(name).done()]
+            current_tasks = [
+                task_store.get(name)
+                for name in selected
+                if task_store.get(name) and not task_store.get(name).done()
+            ]
             for task in current_tasks:
                 task.cancel()
             if current_tasks:
@@ -605,16 +699,36 @@ async def main(
             return any(account.enabled and getattr(account, attr, False) for account in accounts)
 
         def telegram_checkiner_active():
-            return bool(checkin_man and config.checkiner and config.checkiner.enabled and has_active_telegram_accounts("checkiner"))
+            return bool(
+                checkin_man
+                and config.checkiner
+                and config.checkiner.enabled
+                and has_active_telegram_accounts("checkiner")
+            )
 
         def telegram_monitor_active():
-            return bool(monitor_man and config.monitor and config.monitor.enabled and has_active_telegram_accounts("monitor"))
+            return bool(
+                monitor_man
+                and config.monitor
+                and config.monitor.enabled
+                and has_active_telegram_accounts("monitor")
+            )
 
         def telegram_messager_active():
-            return bool(message_man and config.messager and config.messager.enabled and has_active_telegram_accounts("messager"))
+            return bool(
+                message_man
+                and config.messager
+                and config.messager.enabled
+                and has_active_telegram_accounts("messager")
+            )
 
         def telegram_registrar_active():
-            return bool(register_man and config.registrar and config.registrar.enabled and has_active_telegram_accounts("registrar"))
+            return bool(
+                register_man
+                and config.registrar
+                and config.registrar.enabled
+                and has_active_telegram_accounts("registrar")
+            )
 
         def notifier_uses_telegram_proxy():
             return bool(
@@ -656,7 +770,12 @@ async def main(
             targets = set()
 
             emby_accounts = config.emby.account if config.emby and config.emby.account else []
-            if emby_man and config.emby and config.emby.enabled and any(a.enabled and a.use_proxy for a in emby_accounts):
+            if (
+                emby_man
+                and config.emby
+                and config.emby.enabled
+                and any(a.enabled and a.use_proxy for a in emby_accounts)
+            ):
                 targets.add("emby")
 
             subsonic_accounts = config.subsonic.account if config.subsonic and config.subsonic.account else []
@@ -742,11 +861,15 @@ async def main(
             )
 
             if not telegram_targets and not media_targets and not clean_telegram_sessions:
-                logger.bind(scheme="config").info("检测到代理设置变更, 当前没有运行中的模块依赖该代理, 跳过重启.")
+                logger.bind(scheme="config").info(
+                    "检测到代理设置变更, 当前没有运行中的模块依赖该代理, 跳过重启."
+                )
                 return
 
             async with runtime_restart_lock:
-                await restart_telegram_runtime_locked("代理设置", telegram_targets, clean_sessions=clean_telegram_sessions)
+                await restart_telegram_runtime_locked(
+                    "代理设置", telegram_targets, clean_sessions=clean_telegram_sessions
+                )
                 await restart_media_runtime_locked("代理设置", media_targets)
 
         def handle_telegram_use_proxy_change(*args):
