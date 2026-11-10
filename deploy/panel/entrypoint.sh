@@ -3,7 +3,7 @@
 #
 # 职责:
 #   1. 准备数据目录 (内含 config.toml, cache.json, 会话, 日志与面板自身状态)
-#   2. 首次运行时生成空配置文件 (等价于全部默认值, 之后可在面板中修改)
+#   2. 首次运行时从 EK_CONFIG 导入旧配置, 没有则生成空配置文件 (等价于全部默认值)
 #   3. 校验面板访问密码 EK_WEBPASS
 #   4. 启动面板 (面板会自动拉起被托管的 Embykeeper 业务后端)
 
@@ -22,6 +22,25 @@ done
 basedir="${EMBYKEEPERAPI_BASEDIR:-/app}"
 
 mkdir -p "${basedir}"
+
+# 兼容旧版部署: 把 EK_CONFIG (base64 TOML) 落地成配置文件, 让面板接口与业务后端
+# 都从同一个文件读写. 仅在文件不存在或为空时导入, 避免覆盖面板里已保存的修改.
+if [ -z "${EK_MONGODB:-}" ] && [ -n "${EK_CONFIG:-}" ]; then
+    if [ ! -s "${basedir}/config.toml" ]; then
+        tmp_config="$(mktemp)"
+        if printf '%s' "${EK_CONFIG}" | tr -d '[:space:]' | base64 -d > "${tmp_config}" 2>/dev/null \
+            && python -c 'import sys, tomli; tomli.load(open(sys.argv[1], "rb"))' "${tmp_config}" 2>/dev/null; then
+            mv "${tmp_config}" "${basedir}/config.toml"
+            echo ">> 已从 EK_CONFIG 导入配置到 ${basedir}/config.toml."
+        else
+            rm -f "${tmp_config}"
+            echo "!! EK_CONFIG 不是合法的 base64 TOML, 已忽略." >&2
+        fi
+    fi
+    # EK_CONFIG 存在时 config.reload_conf() 会优先使用它, 导致面板保存的修改不生效;
+    # 配置已落地为文件, 这里移除环境变量, 让面板和业务后端都以文件为准.
+    unset EK_CONFIG
+fi
 
 if [ -n "${EK_MONGODB:-}" ]; then
     echo ">> 检测到 EK_MONGODB: 配置、缓存与面板设置将保存在 MongoDB, 无需挂载数据目录."
